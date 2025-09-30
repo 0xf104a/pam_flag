@@ -42,9 +42,9 @@ The module has two operating modes:
 * `require` - requires flag to be set, fails if flag is not set
 The mode is passed as `mode` parameter.
 ## timeout
-An integer value in seconds. Descibes after which time the flag is invalidated.
+A non-negative integer value in seconds. Descibes after which time the flag is invalidated.
 In other words, it is an actual flag time-to-live.
-If timeout is negative, it is ignored and flag is never invalidated.
+If timeout is zero, it is ignored and flag is never invalidated.
 ## Example
 This example shows how you can direct authentication towards less secure but easier method if flag is present
 and towards secure method if flag is missing.

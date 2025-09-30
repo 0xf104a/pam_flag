@@ -36,6 +36,7 @@
 #include <limits.h>
 
 #define UNUSED  __attribute__((unused))
+#define PATH_BUF_SZ 512 /* Size of path buffer */
 
 /**
  * Creates a directory or updates permissions if it already exists.
@@ -43,30 +44,41 @@
  */
 static bool ensure_dir(pam_handle_t *pamh, const char *dir) {
     struct stat st;
-    if (stat(dir, &st) == 0) { /* directory exists */
-        if (S_ISLNK(st.st_mode)) {
-            pam_syslog(pamh, LOG_ERR, "%s is a symlink; refusing", dir);
-            return false;
-        }
-        if (!S_ISDIR(st.st_mode)) {
-            pam_syslog(pamh, LOG_ERR, "%s exists and is not a directory", dir);
-            return false;
-        }
-        if(st.st_uid != 0){
-            pam_syslog(pamh, LOG_ERR, "%s exists and is not owned by root", dir);
-            return false;
-        }
-        if ((st.st_mode & 0777) != 0700) {
-            pam_syslog(pamh, LOG_NOTICE, "%s exists but is not 0700", dir);
-            if (chmod(dir, 0700) != 0) {
-                pam_syslog(pamh, LOG_ERR, "chmod %s: %s", dir, strerror(errno));
+    int fd = openat(AT_FDCWD, dir, O_NOFOLLOW | O_DIRECTORY | O_NOATIME | O_CLOEXEC);
+    if (fd >= 0) {
+        if (fstat(fd, &st) == 0) { /* directory exists */
+            if (S_ISLNK(st.st_mode)) {
+                pam_syslog(pamh, LOG_ERR, "%s is a symlink; refusing", dir);
+                close(fd);
                 return false;
             }
+            if (!S_ISDIR(st.st_mode)) {
+                pam_syslog(pamh, LOG_ERR, "%s exists and is not a directory", dir);
+                close(fd);
+                return false;
+            }
+            if(st.st_uid != 0){
+                pam_syslog(pamh, LOG_ERR, "%s exists and is not owned by root", dir);
+                close(fd);
+                return false;
+            }
+            if ((st.st_mode & 0777) != 0700) {
+                pam_syslog(pamh, LOG_NOTICE, "%s exists but is not 0700", dir);
+                if (fchmod(fd, 0700) != 0) {
+                    pam_syslog(pamh, LOG_ERR, "chmod %s: %s (%s:%d)", dir, strerror(errno), __FILE__, __LINE__);
+                    close(fd);
+                    return false;
+                }
+            }
+            close(fd);
+            return true;
+        } else {
+            pam_syslog(pamh, LOG_ERR, "fstat %s(%d): %s (%s:%d)", dir, fd, strerror(errno), __FILE__, __LINE__);
+            close(fd);
+            return false;
         }
-        return true;
-    }
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        pam_syslog(pamh, LOG_ERR, "mkdir %s: %s", dir, strerror(errno));
+    } else if (mkdir(dir, 0700) != 0) {
+        pam_syslog(pamh, LOG_ERR, "mkdir %s: %s (%s:%d)", dir, strerror(errno), __FILE__, __LINE__);
         return false;
     }
     return true;
@@ -92,20 +104,26 @@ static bool touch_mtime_now(pam_handle_t *pamh, const char *path) {
     ts[0].tv_nsec = UTIME_OMIT;
     ts[1].tv_nsec = UTIME_NOW;
     if (utimensat(AT_FDCWD, path, ts, AT_SYMLINK_NOFOLLOW) == -1) {
-        pam_syslog(pamh, LOG_ERR, "utimensat %s: %s", path, strerror(errno));
+        pam_syslog(pamh, LOG_ERR, "utimensat %s: %s (%s:%d)", path, strerror(errno), __FILE__, __LINE__);
         return false;
     }
     return true;
 }
 
 static bool validate_flag(pam_handle_t *pamh, const char *path){
-    struct stat st;
-    if (lstat(path, &st) != 0) {
-        pam_syslog(pamh, LOG_ERR, "lstat %s: %s", path, strerror(errno));
+    int fd = openat(AT_FDCWD, path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        pam_syslog(pamh, LOG_ERR, "openat %s: %s (%s:%d)", path, strerror(errno), __FILE__, __LINE__);
         return false;
     }
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        pam_syslog(pamh, LOG_ERR, "fstat %s(%d): %s (%s:%d)", path, fd, strerror(errno), __FILE__, __LINE__);
+        return false;
+    }
+    close(fd);
     if (!S_ISREG(st.st_mode) || st.st_uid != 0 || (st.st_mode & 0777) != 0600) {
-        pam_syslog(pamh, LOG_ERR, "refusing to use pre-existing unsafe flag %s", path);
+        pam_syslog(pamh, LOG_ERR, "refusing to use pre-existing unsafe flag %s because of wrong UID or mode", path);
         return false;
     }
     return true;
@@ -116,7 +134,7 @@ static bool validate_flag(pam_handle_t *pamh, const char *path){
  * Returns true if flag exists with proper permissions after call and false if not
  */
 static bool create_flag(pam_handle_t *pamh, uid_t uid) {
-    char path[512];
+    char path[PATH_BUF_SZ];
     memset(path, 0, sizeof(path));
     if (!flag_path(pamh, uid, path, sizeof(path))){
         pam_syslog(pamh, LOG_ERR, "can not create flag path");
@@ -124,14 +142,14 @@ static bool create_flag(pam_handle_t *pamh, uid_t uid) {
     }
 
     if(strlen(path) == 0){
-        pam_syslog(pamh, LOG_ERR, "can not create flag path, path is empty. If you see this message, please report it to the developers.");
+        pam_syslog(pamh, LOG_ERR, "can not create flag path, path is empty. This is a bug.");
         return false;
     }
 
 
     // Create with restrictive perms, fail if races
     mode_t old_umask = umask(0077);
-    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
     umask(old_umask);
 
     if (fd < 0) {
@@ -141,7 +159,7 @@ static bool create_flag(pam_handle_t *pamh, uid_t uid) {
             }
             return touch_mtime_now(pamh, path);
         }
-        pam_syslog(pamh, LOG_ERR, "open %s: %s", path, strerror(errno));
+        pam_syslog(pamh, LOG_ERR, "open %s: %s (%s:%d)", path, strerror(errno), __FILE__, __LINE__);
         return false;
     }
     pam_syslog(pamh, LOG_NOTICE, "created flag for uid %u at path %s", (unsigned)uid, path);
@@ -149,7 +167,12 @@ static bool create_flag(pam_handle_t *pamh, uid_t uid) {
     return true;
 }
 
-static bool has_timed_out(pam_handle_t *pamh, const char *path, time_t timeout) {
+static bool has_timed_out(pam_handle_t *pamh, int fd, time_t timeout) {
+    if (fd < 0){
+        pam_syslog(pamh, LOG_ERR, "invalid fd %d in has_timed_out(). This is a bug.", fd);
+        return true;
+    }
+
     if (timeout == 0){
          pam_syslog(pamh, LOG_NOTICE, "Timeouts are disabled by zero value");
          return false;
@@ -161,34 +184,34 @@ static bool has_timed_out(pam_handle_t *pamh, const char *path, time_t timeout) 
     }
 
     struct stat st;
-    if (stat(path, &st) != 0) {
-        pam_syslog(pamh, LOG_ERR, "stat %s: %s", path, strerror(errno));
+    if (fstat(fd, &st) != 0) {
+        pam_syslog(pamh, LOG_ERR, "fstat %d: %s (%s:%d)", fd, strerror(errno), __FILE__, __LINE__);
         return true;
     }
 
     time_t now = time(NULL);
     if (now == (time_t)-1) {
-        pam_syslog(pamh, LOG_ERR, "time() failed: %s", strerror(errno));
+        pam_syslog(pamh, LOG_ERR, "time() failed: %s (%s:%d)", strerror(errno), __FILE__, __LINE__);
         return true;
     }
 
     time_t mtime = st.st_mtime;
 
     if (mtime > now) {
-        pam_syslog(pamh, LOG_WARNING, "mtime of %s is in the future", path);
+        pam_syslog(pamh, LOG_WARNING, "mtime of %d is in the future", fd);
         return true;
     }
 
-    pam_syslog(pamh, LOG_DEBUG, "mtime of %s is %ld, now is %ld", path, mtime, now);
+    pam_syslog(pamh, LOG_DEBUG, "mtime of %d is %ld, now is %ld", fd, mtime, now);
 
-    return (now - mtime) >= timeout;
+    return (now >= mtime) && ((now - mtime) >= timeout);
 }
 
 /**
  * Checks that there is a valid flag file for a given user
  */
 static bool have_valid_flag(pam_handle_t *pamh, uid_t uid, time_t timeout) {
-    char path[512];
+    char path[PATH_BUF_SZ];
     memset(path, 0, sizeof(path));
     if (!flag_path(pamh, uid, path, sizeof(path))){
          pam_syslog(pamh, LOG_ERR, "can not create flag path");
@@ -196,18 +219,28 @@ static bool have_valid_flag(pam_handle_t *pamh, uid_t uid, time_t timeout) {
     }
     struct stat st;
 
-    if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+    int fd = openat(AT_FDCWD, path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        pam_syslog(pamh, LOG_ERR, "openat %s: %s (%s:%d)", path, strerror(errno), __FILE__, __LINE__);
+        return false;
+    }
+
+    if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
         // basic sanity: owner root, 0600
         if (st.st_uid != 0) {
             pam_syslog(pamh, LOG_ERR, "uid %u flag not owned by root", (unsigned)uid);
+            close(fd);
             return false;
         }
         if ((st.st_mode & 0777) != 0600) {
             pam_syslog(pamh, LOG_ERR, "uid %u flag permissions are not restrictive enough. Refusing to use it.",
                        (unsigned)uid);
+            close(fd);
             return false;
         }
-        return !has_timed_out(pamh, path, timeout);
+        bool still_valid = !has_timed_out(pamh, fd, timeout);
+        close(fd);
+        return still_valid;
     }
     return false;
 }
@@ -259,7 +292,7 @@ PAM_EXTERN int pam_sm_authenticate(pam_handle_t *pamh, int UNUSED flags,
     const char *mode = parse_mode(argc, argv);
     time_t timeout = parse_timeout(pamh, argc, argv);
     if(timeout < 0){
-        pam_syslog(pamh, LOG_ERROR, "negative timeout is prohibited", (unsigned)timeout);
+        pam_syslog(pamh, LOG_ERR, "negative timeout is prohibited");
         return PAM_AUTH_ERR;
     }
 

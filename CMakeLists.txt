@@ -30,6 +30,14 @@ target_compile_options(pam_flag PRIVATE
         -Wall
         -Wextra
         -O2
+        -fstack-protector-strong
+        -fPIE
+        -Wl,-z,relro,-z,now
+        -Wformat=2
+        -Wconversion
+        -Wshadow
+        -fno-common
+        -D_FORTIFY_SOURCE=3
 )
 
 # PAM modules should not have the default "lib" prefix and should be named pam_*
