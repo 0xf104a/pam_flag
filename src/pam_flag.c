@@ -44,7 +44,7 @@
  */
 static bool ensure_dir(pam_handle_t *pamh, const char *dir) {
     struct stat st;
-    int fd = openat(AT_FDCWD, dir, O_NOFOLLOW | O_DIRECTORY | O_NOATIME | O_CLOEXEC);
+    int fd = openat(AT_FDCWD, dir, O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC);
     if (fd >= 0) {
         if (fstat(fd, &st) == 0) { /* directory exists */
             if (S_ISLNK(st.st_mode)) {
